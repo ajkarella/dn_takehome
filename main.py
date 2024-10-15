@@ -30,19 +30,48 @@ from delta import *
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 import os
+import csv
+import xml.etree.ElementTree as et
+import pandas as pd
+
+def xml_data_convesion(xml_files: list) -> None:
+    """Prepares files in ttpd_data for querying by spark.
+
+    Parameters:
+        xml_files (list):The list of xml files to be converted into a csv.
+
+    Returns:
+        None
+    """
+    rows = [] 
+    for xml_file in xml_files:
+        cols = ["person_id", "license_plate", "vin", "color", "year"] 
+        xmlparse = et.parse(f"ttpd_data/automobiles/{xml_file}") 
+        root = xmlparse.getroot() 
+        for i in root: 
+            rows.append({"person_id": i.find("person_id").text , 
+                        "license_plate": i.find("license_plate").text , 
+                        "vin": i.find("vin").text , 
+                        "color": i.find("color").text , 
+                        "year": i.find("year").text }) 
+    
+    df = pd.DataFrame(rows, columns=cols) 
+    df.to_csv("ttpd_data/automobiles/automobiles.csv",index=False)
 
 
-def prep_files(tables: list) -> None:
+
+def prep_files(tables) -> None:
     """Prepares files in ttpd_data for querying by spark.
 
     Parameters:
         tables (list):The list of table names to be organized into directories/partitions.
 
     Returns:
-        spark (SparkSession): the active Spark Session
+        None
     """
     data_folder = "ttpd_data"
     files = [f for f in os.listdir(data_folder) if "." in f]
+    
     for table in tables:
         try:
             os.mkdir(f"ttpd_data/{table}")
@@ -52,6 +81,9 @@ def prep_files(tables: list) -> None:
         for file in files:
             if table in file:
                 os.rename(f"{data_folder}/{file}", f"{data_folder}/{table}/{file}")
+
+    xml_files = [f for f in os.listdir("ttpd_data/automobiles") if ".xml" in f]
+    xml_data_convesion(xml_files)
 
 
 def get_spark_session() -> SparkSession:
@@ -85,6 +117,10 @@ def main():
         spark.read.json("ttpd_data/speeding_tickets/*.json")
         .select("*", F.inline("speeding_tickets"))
         .drop("speeding_tickets")
+    )
+
+    df_cars = spark.read.csv(
+        "ttpd_data/automobiles/automobiles.csv", header="true"
     )
 
     # creating a column for fees
@@ -154,22 +190,40 @@ def main():
     )
     df_tickets_years.write.format("delta").mode("overwrite").save("data/tickets_years")
 
-    # getting most spent by speeders
+    # getting most spent by speeders by license plate
     df_speeders = df_tickets.groupBy("license_plate").agg(
         F.sum("fee").alias("total_fees"),
         F.count("license_plate").alias("total_tickets"),
     )
-    df_speeders = df_speeders.orderBy("total_fees", ascending=False)
 
-    # saving 3rd answer here
-    df_speeders.write.format("delta").mode("overwrite").save("data/speeders")
+    # now join cars to speeders
+    df_speeders_joined = df_speeders.join(
+        df_cars, df_speeders.license_plate == df_cars.license_plate, how="inner"
+    )
+
+    # then join people
+    df_speeders_joined = df_speeders_joined.join(
+        df_people, df_speeders_joined.person_id == df_people.id, how="inner"
+    )
+
+
+    df_speeders_joined = df_speeders_joined.groupBy("person_id").agg(
+        F.sum("total_fees").alias("total_fees"),
+        F.sum("total_tickets").alias("total_tickets"),
+        F.max("first_name"),
+        F.max("last_name"),
+    )
+
+    df_speeders_joined = df_speeders_joined.orderBy("total_fees", ascending=False)
+
+    df_speeders_joined.write.format("delta").mode("overwrite").save("data/speeders")
 
     """
     df_most_tickets.show() # first answer
     df_tickets_quarters.show() # second answer
     df_tickets_months.show(df_tickets_months.count()) # second (bonus) answer
     df_tickets_years.show() # second (bonus) answer
-    df_speeders.show() # third answer
+    df_speeders_joined.show() # third answer
     """
 
 
